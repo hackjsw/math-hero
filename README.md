@@ -19,8 +19,7 @@
 - 创建 / 加入房间，最多 **4 人同时 PK**
 - 实时进度赛道，看到对手答题进度
 - 答题连击自动发送嘲讽表情 😈
-- D1 数据库强一致性，跨设备秒同步
-- 乐观锁防并发覆盖，数据不丢失
+- D1 强一致性 + 乐观锁，跨设备秒同步
 
 ### 🏪 商店 & 换装
 - 金币购买 **表情头像** 和 **主题皮肤**
@@ -40,13 +39,13 @@
 | 组件 | 技术 |
 |------|------|
 | 运行时 | Cloudflare Workers |
-| 用户数据存储 | Cloudflare KV |
-| 对战房间存储 | Cloudflare D1 (SQLite) |
+| 数据库 | Cloudflare D1 (SQLite) |
 | 前端框架 | 原生 HTML + JS（单文件内嵌） |
 | CSS | TailwindCSS CDN |
 | 部署方式 | Cloudflare Dashboard 直接粘贴 |
 
 整个项目只有一个 `workers.js` 文件，包含 API 后端 + 完整前端页面，无需构建工具。
+全部数据存储在 **一个 D1 数据库** 中（用户、排行榜、对战房间），无需 KV。
 
 ---
 
@@ -57,14 +56,26 @@
 
 ### 步骤
 
-#### 1. 创建 KV 存储
-- 进入 Cloudflare Dashboard → **Workers & Pages** → **KV**
-- 创建一个 KV 命名空间（如 `math-kv`）
+#### 1. 创建 D1 数据库
+- 进入 Cloudflare Dashboard → **D1** → 创建数据库（如 `cfmath`）
+- 在数据库 **Console** 中执行以下建表 SQL：
 
-#### 2. 创建 D1 数据库
-- 进入 **D1** → 创建数据库（如 `battle_rooms`）
-- 在数据库 **Console** 中执行：
 ```sql
+-- 用户数据
+CREATE TABLE IF NOT EXISTS users (
+  name TEXT PRIMARY KEY,
+  data TEXT NOT NULL
+);
+
+-- 排行榜
+CREATE TABLE IF NOT EXISTS leaderboard (
+  name TEXT PRIMARY KEY,
+  exp INTEGER DEFAULT 0,
+  level INTEGER DEFAULT 1,
+  avatar TEXT DEFAULT '🐻'
+);
+
+-- 对战房间
 CREATE TABLE IF NOT EXISTS rooms (
   code TEXT PRIMARY KEY,
   data TEXT NOT NULL,
@@ -72,17 +83,16 @@ CREATE TABLE IF NOT EXISTS rooms (
 );
 ```
 
-#### 3. 创建 Worker
+#### 2. 创建 Worker
 - 进入 **Workers & Pages** → **Create** → **Create Worker**
 - 将 `workers.js` 的内容粘贴到编辑器中
 - 点击 **Deploy**
 
-#### 4. 绑定存储
+#### 3. 绑定数据库
 - 进入 Worker → **Settings** → **Bindings**
-- 添加 **KV Namespace** → 变量名填 `MATH_KV`，选择你创建的 KV
 - 添加 **D1 Database** → 变量名填 `battle_rooms`，选择你创建的 D1 数据库
 
-#### 5. 访问
+#### 4. 访问
 - 打开你的 Worker URL（如 `https://your-worker.your-subdomain.workers.dev`）
 - 输入昵称即可开始游戏 🎉
 
