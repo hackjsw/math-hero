@@ -25,35 +25,44 @@ export default {
             });
         }
 
-        const checkKV = () => {
-            if (!env.MATH_KV) return false;
-            return true;
-        };
+        const checkD1 = () => !!env.battle_rooms;
+
+        // D1 用户数据读写
+        async function getUser(name) {
+            const row = await env.battle_rooms.prepare(
+                "SELECT data FROM users WHERE name = ?"
+            ).bind(name).first();
+            return row ? JSON.parse(row.data) : null;
+        }
+
+        async function putUser(name, data) {
+            await env.battle_rooms.prepare(
+                "INSERT OR REPLACE INTO users (name, data) VALUES (?, ?)"
+            ).bind(name, JSON.stringify(data)).run();
+        }
 
         try {
             // ==========================================
             // API 1：获取用户数据
             // ==========================================
             if (pathname === "/api/get-user") {
-                if (!checkKV()) return jsonRes({ error: "服务器异常：未绑定 MATH_KV" }, 500);
+                if (!checkD1()) return jsonRes({ error: "服务器异常：未绑定 D1 数据库" }, 500);
 
                 const name = searchParams.get("name");
                 if (!name) return jsonRes({ error: "需要提供名称" }, 400);
 
-                let dataStr = await env.MATH_KV.get("user_" + name);
-                let data;
-                const today = new Date(Date.now() + 8 * 3600000).toDateString(); // UTC+8 中国时区
+                let data = await getUser(name);
+                const today = new Date(Date.now() + 8 * 3600000).toDateString();
 
-                if (!dataStr) {
+                if (!data) {
                     data = {
                         level: 1, exp: 0, coins: 0, pbs: {}, mistakes: [],
                         unlockedAvatars: ['🐻'], currentAvatar: '🐻',
                         unlockedThemes: ['default'], currentTheme: 'default',
                         streak: 1, lastLogin: today
                     };
-                    await env.MATH_KV.put("user_" + name, JSON.stringify(data));
+                    await putUser(name, data);
                 } else {
-                    data = JSON.parse(dataStr);
                     data.coins = data.coins || 0;
                     data.exp = parseInt(data.exp) || 0;
                     data.level = parseInt(data.level) || 1;
@@ -73,7 +82,7 @@ export default {
                             data.streak = 1;
                         }
                         data.lastLogin = today;
-                        await env.MATH_KV.put("user_" + name, JSON.stringify(data));
+                        await putUser(name, data);
                     }
                 }
                 return jsonRes(data);
@@ -83,11 +92,10 @@ export default {
             // API 2：保存成绩并结算
             // ==========================================
             if (pathname === "/api/save-result" && request.method === "POST") {
-                if (!checkKV()) return jsonRes({ error: "未绑定 MATH_KV" }, 500);
+                if (!checkD1()) return jsonRes({ error: "未绑定 D1 数据库" }, 500);
                 const { name, result } = await request.json();
 
-                let dataStr = await env.MATH_KV.get("user_" + name);
-                let data = dataStr ? JSON.parse(dataStr) : {
+                let data = await getUser(name) || {
                     level: 1, exp: 0, coins: 0, pbs: {}, mistakes: [],
                     unlockedAvatars: ['🐻'], currentAvatar: '🐻',
                     unlockedThemes: ['default'], currentTheme: 'default'
@@ -132,22 +140,13 @@ export default {
                     data.mistakes = data.mistakes.filter(m => !result.correctOnes.includes(m.q));
                 }
 
-                await env.MATH_KV.put("user_" + name, JSON.stringify(data));
+                await putUser(name, data);
 
+                // 更新排行榜（D1 表）
                 if (result.exp > 0) {
-                    let lbStr = await env.MATH_KV.get("global_leaderboard");
-                    let lb = lbStr ? JSON.parse(lbStr) : [];
-                    let userIndex = lb.findIndex(x => x.name === name);
-                    if (userIndex >= 0) {
-                        lb[userIndex].exp = data.exp;
-                        lb[userIndex].level = data.level;
-                        lb[userIndex].avatar = data.currentAvatar;
-                    } else {
-                        lb.push({ name, exp: data.exp, level: data.level, avatar: data.currentAvatar });
-                    }
-                    lb.sort((a, b) => b.exp - a.exp);
-                    lb = lb.slice(0, 50);
-                    await env.MATH_KV.put("global_leaderboard", JSON.stringify(lb));
+                    await env.battle_rooms.prepare(
+                        "INSERT OR REPLACE INTO leaderboard (name, exp, level, avatar) VALUES (?, ?, ?, ?)"
+                    ).bind(name, data.exp, data.level, data.currentAvatar).run();
                 }
 
                 return jsonRes({
@@ -165,11 +164,10 @@ export default {
             // API 3：行为处理 (商店与换装)
             // ==========================================
             if (pathname === "/api/action" && request.method === "POST") {
-                if (!checkKV()) return jsonRes({ error: "未绑定 MATH_KV" }, 500);
+                if (!checkD1()) return jsonRes({ error: "未绑定 D1 数据库" }, 500);
                 const { name, action, payload } = await request.json();
-                let dataStr = await env.MATH_KV.get("user_" + name);
-                if (!dataStr) return jsonRes({ error: "未找到用户数据，请重新登录" }, 400);
-                let data = JSON.parse(dataStr);
+                let data = await getUser(name);
+                if (!data) return jsonRes({ error: "未找到用户数据，请重新登录" }, 400);
 
                 let success = false, msg = "";
 
@@ -198,18 +196,13 @@ export default {
                     }
                 }
 
-                await env.MATH_KV.put("user_" + name, JSON.stringify(data));
+                await putUser(name, data);
 
+                // 换头像时同步更新排行榜
                 if (success && action === 'equip' && payload.type === 'avatar') {
-                    let lbStr = await env.MATH_KV.get("global_leaderboard");
-                    if (lbStr) {
-                        let lb = JSON.parse(lbStr);
-                        let uIndex = lb.findIndex(x => x.name === name);
-                        if (uIndex >= 0) {
-                            lb[uIndex].avatar = data.currentAvatar;
-                            await env.MATH_KV.put("global_leaderboard", JSON.stringify(lb));
-                        }
-                    }
+                    await env.battle_rooms.prepare(
+                        "UPDATE leaderboard SET avatar = ? WHERE name = ?"
+                    ).bind(data.currentAvatar, name).run();
                 }
 
                 return jsonRes({ success, msg, user: data });
@@ -219,15 +212,16 @@ export default {
             // API 4：排行榜获取
             // ==========================================
             if (pathname === "/api/leaderboard") {
-                if (!checkKV()) return jsonRes([]);
-                let lbStr = await env.MATH_KV.get("global_leaderboard");
-                return jsonRes(lbStr ? JSON.parse(lbStr) : []);
+                if (!checkD1()) return jsonRes([]);
+                const { results } = await env.battle_rooms.prepare(
+                    "SELECT name, exp, level, avatar FROM leaderboard ORDER BY exp DESC LIMIT 50"
+                ).all();
+                return jsonRes(results || []);
             }
 
             // ==========================================
-            // D1 辅助函数：强一致性房间读写（替代 KV）
+            // D1 辅助函数：对战房间读写
             // ==========================================
-            const checkD1 = () => !!env.battle_rooms;
 
             async function getRoom(code) {
                 const row = await env.battle_rooms.prepare(
@@ -414,15 +408,52 @@ export default {
             }
 
             // ==========================================
-            // API 10：多人对战 - 结算金币
+            // API 10：多人对战 - 重置房间（再来一局）
+            // ==========================================
+            if (pathname === "/api/battle/reset" && request.method === "POST") {
+                if (!checkD1()) return jsonRes({ error: "未绑定 D1 数据库 battle_rooms" }, 500);
+                const { roomCode } = await request.json();
+                const room = await updateRoomSafe(roomCode, (r) => {
+                    r.status = 'waiting';
+                    r.questions = [];
+                    r.startedAt = 0;
+                    r.players.forEach(p => {
+                        p.progress = 0;
+                        p.finished = false;
+                        p.time = 0;
+                        p.accuracy = 0;
+                        p.combo = 0;
+                        p.tauntMsg = '';
+                        p.tauntTime = 0;
+                        if (p.name !== r.host) p.isReady = false;
+                    });
+                });
+                if (!room) return jsonRes({ error: '房间不存在' }, 404);
+                return jsonRes({ room });
+            }
+
+            // ==========================================
+            // API 10.5：多人对战 - 修改房间配置
+            // ==========================================
+            if (pathname === "/api/battle/config" && request.method === "POST") {
+                if (!checkD1()) return jsonRes({ error: "未绑定 D1 数据库 battle_rooms" }, 500);
+                const { roomCode, grade, types, count } = await request.json();
+                const room = await updateRoomSafe(roomCode, (r) => {
+                    r.config = { grade: grade || 'g34', types: types || [], count: count || 10 };
+                });
+                if (!room) return jsonRes({ error: '房间不存在' }, 404);
+                return jsonRes({ room });
+            }
+
+            // ==========================================
+            // API 11：多人对战 - 结算金币
             // ==========================================
             if (pathname === "/api/battle/save-coins" && request.method === "POST") {
                 const { name, coins } = await request.json();
-                let dataStr = await env.MATH_KV.get("user_" + name);
-                if (!dataStr) return jsonRes({ error: '用户不存在' }, 404);
-                let data = JSON.parse(dataStr);
+                let data = await getUser(name);
+                if (!data) return jsonRes({ error: '用户不存在' }, 404);
                 data.coins += coins;
-                await env.MATH_KV.put("user_" + name, JSON.stringify(data));
+                await putUser(name, data);
                 return jsonRes({ coins: data.coins });
             }
 
@@ -580,7 +611,10 @@ const htmlContent = `<!DOCTYPE html>
                     <div class="flex-grow min-w-0">
                         <div class="flex justify-between items-center mb-1">
                             <span class="font-black text-lg truncate" id="display-name">英雄</span>
-                            <span class="text-[10px] font-bold bg-white/25 px-2 py-0.5 rounded-full" id="display-rank">新手</span>
+                            <div class="flex items-center gap-1">
+                                <button onclick="if(document.fullscreenElement){document.exitFullscreen()}else{document.documentElement.requestFullscreen().catch(()=>{})}" class="bg-white/25 text-white text-[10px] font-bold px-2 py-0.5 rounded-full active:bg-white/40">⛶</button>
+                                <span class="text-[10px] font-bold bg-white/25 px-2 py-0.5 rounded-full" id="display-rank">新手</span>
+                            </div>
                         </div>
                         <div class="w-full bg-black/20 h-3.5 rounded-full overflow-hidden mb-1" style="border: 2px solid rgba(255,255,255,0.3)"><div id="exp-bar" class="bg-white h-full exp-bar-fill rounded-full" style="width:0%"></div></div>
                         <div class="flex justify-between text-[11px] font-bold opacity-90">
@@ -764,6 +798,23 @@ const htmlContent = `<!DOCTYPE html>
                 <div class="text-xs font-bold text-yellow-600">⚡ 对战规则</div>
                 <div class="text-[11px] text-yellow-500 mt-1 font-bold">答错罚时 10 秒！总用时定胜负！无经验加成</div>
             </div>
+            <div id="room-config-section" class="hidden">
+                <div class="bg-white rounded-2xl p-3 border-2 border-gray-100 space-y-2">
+                    <div class="flex justify-between items-center">
+                        <span class="text-xs font-black text-gray-500">🎓 年级</span>
+                        <span class="text-xs font-bold text-theme-main" id="room-config-grade">三四年级</span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-xs font-black text-gray-500">✏️ 题型</span>
+                        <span class="text-xs font-bold text-theme-main" id="room-config-types">加法</span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-xs font-black text-gray-500">📝 题数</span>
+                        <span class="text-xs font-bold text-theme-main" id="room-config-count">10</span>
+                    </div>
+                    <button id="btn-edit-room-config" class="hidden btn-cute w-full py-2 rounded-xl font-bold text-xs text-purple-600 bg-purple-50 border-2 border-purple-200 mt-1">⚙️ 修改配置</button>
+                </div>
+            </div>
             <div class="mt-auto space-y-2">
                 <button id="btn-start-battle" class="btn-cute btn-purple-custom hidden w-full py-4 rounded-2xl font-black text-white text-lg transition-all duration-300">等待成员加入... (1/4)</button>
                 <button id="btn-ready-battle" class="btn-cute btn-warning hidden w-full py-4 rounded-2xl font-black text-white text-lg">🙋‍♂️ 准备</button>
@@ -788,7 +839,7 @@ const htmlContent = `<!DOCTYPE html>
                 </div>
             </div>
             <div class="bg-white px-3 pt-3 pb-2" style="border-bottom:3px solid #F3F4F6">
-                <div class="flex justify-between text-sm mb-2"><span class="font-black text-theme-main bg-theme-light px-2 py-1 rounded-lg" id="battle-progress-text">第 1/10 题</span><button id="btn-fullscreen" onclick="if(document.fullscreenElement){document.exitFullscreen()}else{document.documentElement.requestFullscreen().catch(()=>{})}" class="bg-gray-100 text-gray-500 px-2 py-1 rounded-lg font-bold text-xs active:bg-gray-200">⛶ 全屏</button><span class="font-mono font-black text-orange-500 bg-orange-50 px-2 py-1 rounded-lg" id="battle-timer-text">00.0s</span></div>
+                <div class="flex justify-between text-sm mb-2"><span class="font-black text-theme-main bg-theme-light px-2 py-1 rounded-lg" id="battle-progress-text">第 1/10 题</span><span class="font-mono font-black text-orange-500 bg-orange-50 px-2 py-1 rounded-lg" id="battle-timer-text">00.0s</span></div>
                 <div id="battle-tracks-container" class="space-y-1.5 overflow-y-auto max-h-32 custom-scrollbar pr-1"></div>
             </div>
             <div class="flex-grow flex flex-col items-center justify-center px-6 py-3 relative">
@@ -823,7 +874,10 @@ const htmlContent = `<!DOCTYPE html>
                 <div class="text-sm font-bold text-yellow-600">🪙 参与奖金 <span class="text-[10px]">(×1.2倍)</span></div>
                 <div class="text-3xl font-black text-yellow-600" id="battle-coins-earned">+0</div>
             </div>
-            <button id="btn-battle-restart" class="btn-cute btn-purple-custom w-full py-4 rounded-2xl font-black text-white text-xl mt-auto shrink-0">回到大厅 ⛺</button>
+            <div class="flex gap-2 mt-auto shrink-0">
+                <button id="btn-battle-back-room" class="btn-cute flex-1 py-4 rounded-2xl font-black text-purple-600 text-lg bg-purple-50 border-2 border-purple-200">🔄 再来一局</button>
+                <button id="btn-battle-restart" class="btn-cute flex-1 py-4 rounded-2xl font-black text-gray-500 text-lg bg-gray-100 border-2 border-gray-200">⛺ 回大厅</button>
+            </div>
         </div>
 
     </div>
@@ -1823,6 +1877,14 @@ const htmlContent = `<!DOCTYPE html>
             try {
                 var rd = await saveResult(accuracy, totalTime, game.mistakes, game.correctOnes, game.configKey, game.grade, game.types);
                 
+                // 同步服务端最新数据到本地
+                if (rd.user) {
+                    var curName = user.name;
+                    user = rd.user;
+                    user.name = curName;
+                    updateUI();
+                }
+                
                 safeSet('final-time', totalTime.toFixed(1) + 's'); 
                 safeSet('final-acc', accuracy + '%'); 
                 safeSet('final-exp', '+' + rd.exp + ' EXP'); 
@@ -1964,13 +2026,30 @@ const htmlContent = `<!DOCTYPE html>
             var rBtn = document.getElementById('btn-ready-battle');
             var wMsg = document.getElementById('waiting-msg');
             
+            // 显示房间配置信息
+            var cfgSection = document.getElementById('room-config-section');
+            var editBtn = document.getElementById('btn-edit-room-config');
+            cfgSection.classList.remove('hidden');
+            var gradeNames = { g12: '一二年级', g34: '三四年级', g56: '五六年级' };
+            var typeNames = { add20:'20以内加减', add100:'100以内加减', mult9:'九九乘法表', div9:'表内除法', mult2:'多位数乘法', div2:'多位数除法', round:'灵活凑整', mix1:'基础混合', mixSpeed:'混合速算', decAddSub:'小数加减', decMultDiv:'小数乘除', mix2:'进阶混合' };
+            if (room.config) {
+                safeSet('room-config-grade', gradeNames[room.config.grade] || '三四年级');
+                var tNames = (room.config.types || []).map(function(t) { return typeNames[t] || t; });
+                safeSet('room-config-types', tNames.length > 0 ? tNames.join('、') : '全部');
+                safeSet('room-config-count', (room.config.count || 10) + '题');
+            }
+            if (battle.isHost) {
+                editBtn.classList.remove('hidden');
+            } else {
+                editBtn.classList.add('hidden');
+            }
+            
             if (battle.isHost) { 
                 sBtn.classList.remove('hidden'); 
                 rBtn.classList.add('hidden');
                 wMsg.classList.add('hidden'); 
             } else { 
                 sBtn.classList.add('hidden'); 
-                // 检查自己是否已经准备过（防止网络波动重连）
                 var me = room.players.find(p => p.name === user.name);
                 if (me && me.isReady) {
                     rBtn.classList.add('hidden');
@@ -2484,10 +2563,63 @@ const htmlContent = `<!DOCTYPE html>
             // leaveBattleRoom moved to btn-battle-restart to prevent removing player data before others poll
         }
 
+        document.getElementById('btn-battle-back-room').onclick = async function() {
+            try {
+                var d = await apiFetch('/api/battle/reset', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({roomCode: battle.roomCode})
+                });
+                battle.finished = false;
+                battle.currentIndex = 0;
+                battle.myProgress = 0;
+                battle.timePenalty = 0;
+                battle.combo = 0;
+                battle.mistakes = [];
+                battle.correctOnes = [];
+                battle.tauntedMilestones = {};
+                clearInterval(battle.pollInterval);
+                clearInterval(battle.timer);
+                if (d && d.room) {
+                    showBattleRoom(d.room);
+                } else {
+                    showScreen('screen-battle-lobby');
+                }
+            } catch(e) {
+                customAlert('房间已解散，返回大厅');
+                showScreen('screen-battle-lobby');
+            }
+        };
+
         document.getElementById('btn-battle-restart').onclick = async function() { 
             await leaveBattleRoom();
             showScreen('screen-setup'); 
             updateUI(); 
+        };
+        
+        document.getElementById('btn-edit-room-config').onclick = function() {
+            showScreen('screen-battle-lobby');
+            document.getElementById('btn-create-room').click();
+            document.getElementById('btn-create-confirm').textContent = '✅ 保存配置';
+            document.getElementById('btn-create-confirm').onclick = async function() {
+                var gradeEl = document.querySelector('input[name="battleGrade"]:checked');
+                var grade = gradeEl ? gradeEl.value : 'g34';
+                var types = [];
+                document.querySelectorAll('#battle-type-checkboxes input:checked').forEach(function(cb) { types.push(cb.value); });
+                var countEl = document.querySelector('input[name="battleCount"]:checked');
+                var count = countEl ? parseInt(countEl.value) : 10;
+                try {
+                    var d = await apiFetch('/api/battle/config', {
+                        method: 'POST',
+                        headers: {'Content-Type':'application/json'},
+                        body: JSON.stringify({roomCode: battle.roomCode, grade: grade, types: types, count: count})
+                    });
+                    battle.grade = grade;
+                    battle.types = types;
+                    battle.count = count;
+                    if (d && d.room) showBattleRoom(d.room);
+                } catch(e) { customAlert('保存失败'); }
+            };
         };
         
         var battleKeypadBtns = document.querySelectorAll('.battle-keypad-btn');
